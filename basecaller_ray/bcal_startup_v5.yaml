@@ -1,0 +1,106 @@
+cluster_name: han-ray-sqbc
+max_workers: 4 # EDIT HERE IF GPU # CONFIG CHANGES  
+
+provider:
+  type: gcp
+  project_id: ece-goenkalab
+  region: us-central1
+  availability_zone: us-central1-a
+
+auth:
+  ssh_user: hansmacbook
+  ssh_private_key: ~/.ssh/google_compute_engine
+
+available_node_types:
+  head_node:
+    node_config:
+      machineType: e2-standard-4
+      disks:
+        - boot: true
+          autoDelete: true
+          type: PERSISTENT
+          initializeParams:
+            diskSizeGb: 30
+            sourceImage: projects/ece-goenkalab/global/images/han-ray-head-node
+      networkInterfaces:
+        - network: global/networks/default
+          accessConfigs:
+            - name: External NAT
+              type: ONE_TO_ONE_NAT
+      serviceAccounts:
+        - email: ray-autoscaler-sa-v1@ece-goenkalab.iam.gserviceaccount.com
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+    resources: {"CPU": 0, "head_slot": 1}
+    min_workers: 0
+    max_workers: 0
+
+  worker_node:
+    node_config:
+      # N1 custom machine with attached V100 GPUs --> n1-custom-24-92160: 24 vCPU, 90 GiB RAM, 2x V100
+      # 24 vCPUs is the max allowed by GCP for 2x V100 (12 vCPU/GPU limit)
+      machineType: n1-custom-24-92160
+      # V100 GPUs must be attached explicitly (N1 does not bundle GPUs like G2/L4)
+      guestAccelerators:
+        - acceleratorCount: 2
+          acceleratorType: nvidia-tesla-v100
+      disks:
+        - boot: true
+          autoDelete: true
+          type: PERSISTENT
+          initializeParams:
+            diskSizeGb: 100
+            sourceImage: projects/ece-goenkalab/global/images/han-ray-worker-v5-hac  # custom image: CUDA drivers + Dorado + Python pre-installed
+        # Ephemeral: data does not persist after VM termination
+        - type: SCRATCH
+          autoDelete: true
+          interface: NVME
+          initializeParams:
+            diskType: zones/us-central1-a/diskTypes/local-ssd
+
+      networkInterfaces:
+        - network: global/networks/default
+          accessConfigs:
+            - name: External NAT
+              type: ONE_TO_ONE_NAT
+
+      # IMPORTANT for GPU VMs: must terminate on host maintenance (no live migration)
+      # automaticRestart: false prevents Ray autoscaler + GCP from fighting each other when an instance is terminated due to STOCKOUT
+      scheduling:
+        onHostMaintenance: TERMINATE
+        automaticRestart: false
+
+      serviceAccounts:
+        - email: ray-worker-sa@ece-goenkalab.iam.gserviceaccount.com
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+
+    resources: {"CPU": 24, "GPU": 2} # EDIT HERE IF GPU # CONFIG CHANGES  
+    min_workers: 0
+    max_workers: 4 # EDIT HERE IF GPU # CONFIG CHANGES  
+
+head_node_type: head_node
+
+head_start_ray_commands:
+  - ray stop || true
+  - ulimit -n 65536
+  # - "RAY_enable_autoscaler_v2=0 ray start --head \
+  - "ray start --head \ 
+    --dashboard-host=0.0.0.0 \
+    --ray-client-server-port=10001 \
+    --port=6379 \
+    --autoscaling-config=$HOME/ray_bootstrap_config.yaml"
+
+worker_start_ray_commands:
+  - bash -lc 'export PATH="$HOME/.local/bin:$PATH"; ray stop || true'
+  - bash -lc 'ulimit -n 65536'
+  # Mount local NVMe SSD(s) to /data before Ray starts; pod5 downloads should target /data 
+  - bash -lc 'sudo bash ~/mount_nvme_ssd.sh'
+  - bash -lc 'export PATH="$HOME/.local/bin:$PATH"; echo "RAY_HEAD_IP=$RAY_HEAD_IP"'
+  - bash -lc 'export PATH="$HOME/.local/bin:$PATH"; ray start --address=$RAY_HEAD_IP:6379'
+
+file_mounts:
+  "~/bcal_demo.py": "./bcal_demo.py"
+  "~/mount_nvme_ssd.sh": "./mount_nvme_ssd.sh"
+
+idle_timeout_minutes: 15
